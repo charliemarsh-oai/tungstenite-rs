@@ -1152,7 +1152,7 @@ mod tests {
             extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
             ..Default::default()
         };
-        let mut extensions = config.extensions.clone().into_unnegotiated_context(Role::Client);
+        let mut extensions = config.extensions.into_unnegotiated_context(Role::Client);
         let mut stream = Cursor::new(Vec::new());
         let mut writer = WebSocket::from_raw_socket(&mut stream, Role::Server, Some(config));
         let part = Bytes::from(vec![b'x'; 1024 * 1024]);
