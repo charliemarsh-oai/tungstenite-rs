@@ -113,9 +113,9 @@ impl DeflateContext {
         }
     }
 
-    /// Compress the payload of an outgoing message.
-    pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Bytes, DeflateError> {
-        self.compress.compress(data).map_err(|e| {
+    /// Compress one fragment and finish the message when `is_final` is set.
+    pub(crate) fn compress(&mut self, data: &[u8], is_final: bool) -> Result<Bytes, DeflateError> {
+        self.compress.compress(data, is_final).map_err(|e| {
             log::debug!("compression failed: {e}");
             DeflateError::Compress
         })
@@ -142,11 +142,8 @@ impl DeflateContext {
 const ELIDED_TRAILER_BLOCK_CONTENTS: &[u8] = &[0x00, 0x00, 0xff, 0xff];
 
 impl DeflateCompress {
-    /// Compress the contents of an entire message.
-    ///
-    /// This is asymmetric with [`DeflateDecompress::decompress`] in that it
-    /// operates on the contents of an entire message, not the comprising frames.
-    fn compress(&mut self, mut data: &[u8]) -> Result<Bytes, std::io::Error> {
+    /// Flush each fragment so the peer can decompress it as it arrives.
+    fn compress(&mut self, mut data: &[u8], is_final: bool) -> Result<Bytes, std::io::Error> {
         log::trace!("compressing message payload with {} bytes", data.len());
         if data.is_empty() {
             // Fast path for an empty payload: it gets DEFLATE compressed to a
@@ -154,6 +151,12 @@ impl DeflateCompress {
             // concat([0x00], ELIDED_TRAILER_BLOCK_CONTENTS). Then, per the RFC,
             // we elide the trailing 4 bytes to get a single 0x00 byte as the
             // compressed payload.
+            if !is_final {
+                return Ok(Bytes::new());
+            }
+            if !self.own_context_takeover {
+                self.compressor.reset();
+            }
             return Ok(Bytes::from_static(&[0x00]));
         }
 
@@ -257,12 +260,11 @@ impl DeflateCompress {
         //         "BTYPE" bits set to 00.
 
         debug_assert!(output.ends_with(ELIDED_TRAILER_BLOCK_CONTENTS), "output is {output:02x?}");
-        output.truncate(output.len() - ELIDED_TRAILER_BLOCK_CONTENTS.len());
-
-        if !self.own_context_takeover {
-            // Reset if the next frame isn't supposed to be starting with the
-            // same compression window.
-            self.compressor.reset();
+        if is_final {
+            output.truncate(output.len() - ELIDED_TRAILER_BLOCK_CONTENTS.len());
+            if !self.own_context_takeover {
+                self.compressor.reset();
+            }
         }
 
         log::trace!("finished compression into {} bytes", output.len());
@@ -410,7 +412,7 @@ pub(crate) mod test {
                 let mut server = DeflateContext::new(Role::Server, config);
 
                 let mut send_and_receive = |data| {
-                    let compressed = client.compress(data).unwrap();
+                    let compressed = client.compress(data, true).unwrap();
 
                     let mut decompressed = Vec::<u8>::new();
 
@@ -441,7 +443,7 @@ pub(crate) mod test {
 
         let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
 
-        let compressed = context.compress(&data).unwrap();
+        let compressed = context.compress(&data, true).unwrap();
 
         assert_eq!(&context.decompress(&compressed, true, usize::MAX).unwrap(), &data);
     }
@@ -451,7 +453,7 @@ pub(crate) mod test {
         let data = vec![0; 1 << 18];
 
         let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
-        let compressed = context.compress(&data).unwrap();
+        let compressed = context.compress(&data, true).unwrap();
 
         // A buffer of all zeros compresses very well.
         assert!(compressed.len() < data.len() / 500);
@@ -477,7 +479,7 @@ pub(crate) mod test {
             let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
             println!("compressing {} bytes of compressible data", prefix.len());
 
-            let compressed = context.compress(prefix).unwrap();
+            let compressed = context.compress(prefix, true).unwrap();
             assert_eq!(context.decompress(&compressed, true, usize::MAX).unwrap(), prefix);
         }
     }
@@ -547,7 +549,7 @@ pub(crate) mod test {
         let mut context = DeflateContext::new(Role::Server, DeflateConfig::default());
 
         for (i, payload) in uncompressed_payloads.enumerate().take(5) {
-            let mut compressed = context.compress(&payload).unwrap().try_into_mut().unwrap();
+            let mut compressed = context.compress(&payload, true).unwrap().try_into_mut().unwrap();
             // The final block in the stream is a 5-byte uncompressed block, but
             // with the trailing 4 bytes of the body chopped off (per the RFC).
             // We don't know where in the last *byte* the final block begins
@@ -592,7 +594,7 @@ pub(crate) mod test {
             const EXPECTED_COMPRESSED_PAYLOAD: &[u8] = &[0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
 
             let mut context = DeflateContext::new(Role::Server, DeflateConfig::default());
-            let compressed = context.compress(b"Hello").unwrap();
+            let compressed = context.compress(b"Hello", true).unwrap();
             assert_eq!(&compressed[..], EXPECTED_COMPRESSED_PAYLOAD);
             //
             //   ...
@@ -652,8 +654,8 @@ pub(crate) mod test {
                 ROLE,
                 DeflateConfig::default().set_no_context_takeover(ROLE, true),
             );
-            assert_eq!(&context.compress(b"Hello").unwrap()[..], FIRST_PAYLOAD);
-            assert_eq!(&context.compress(b"Hello").unwrap()[..], SECOND_PAYLOAD);
+            assert_eq!(&context.compress(b"Hello", true).unwrap()[..], FIRST_PAYLOAD);
+            assert_eq!(&context.compress(b"Hello", true).unwrap()[..], SECOND_PAYLOAD);
 
             //
             //   If the "agreed parameters" did not contain the
@@ -665,8 +667,8 @@ pub(crate) mod test {
             const NEW_SECOND_PAYLOAD: &[u8] = &[0xf2, 0x00, 0x11, 0x00, 0x00];
 
             let mut context = DeflateContext::new(ROLE, DeflateConfig::default());
-            assert_eq!(&context.compress(b"Hello").unwrap()[..], FIRST_PAYLOAD);
-            assert_eq!(&context.compress(b"Hello").unwrap()[..], NEW_SECOND_PAYLOAD);
+            assert_eq!(&context.compress(b"Hello", true).unwrap()[..], FIRST_PAYLOAD);
+            assert_eq!(&context.compress(b"Hello", true).unwrap()[..], NEW_SECOND_PAYLOAD);
         }
 
         #[test]

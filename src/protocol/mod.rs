@@ -571,18 +571,17 @@ impl WebSocketContext {
             return Err(Error::Protocol(ProtocolError::SendAfterClosing));
         }
 
-        let mut prepare_data_frame = |data, opdata| -> Result<Frame, ProtocolError> {
-            const IS_FINAL: bool = true;
+        let mut prepare_data_frame = |data, opdata, is_final| -> Result<Frame, ProtocolError> {
             if let Some(compressor) = self.extensions.per_message_compressor() {
-                let compressed = compressor(&data)?;
-                return Ok(Frame::compressed_message(compressed, opdata, IS_FINAL));
+                let compressed = compressor(&data, is_final)?;
+                return Ok(Frame::compressed_message(compressed, opdata, is_final));
             }
-            Ok(Frame::message(data, OpCode::Data(opdata), IS_FINAL))
+            Ok(Frame::message(data, OpCode::Data(opdata), is_final))
         };
 
         let frame = match message {
-            Message::Text(data) => prepare_data_frame(data.into(), OpData::Text)?,
-            Message::Binary(data) => prepare_data_frame(data, OpData::Binary)?,
+            Message::Text(data) => prepare_data_frame(data.into(), OpData::Text, true)?,
+            Message::Binary(data) => prepare_data_frame(data, OpData::Binary, true)?,
             Message::Ping(data) => Frame::ping(data),
             Message::Pong(data) => {
                 self.set_additional(Frame::pong(data));
@@ -590,7 +589,13 @@ impl WebSocketContext {
                 return self._write(stream, None).map(|_| ());
             }
             Message::Close(code) => return self.close(stream, code),
-            Message::Frame(f) => f,
+            Message::Frame(frame) => match frame.header().opcode {
+                OpCode::Data(opcode) if frame.encode_extensions => {
+                    let is_final = frame.header().is_final;
+                    prepare_data_frame(frame.into_payload(), opcode, is_final)?
+                }
+                _ => frame,
+            },
         };
 
         let should_flush = self._write(stream, Some(frame))?;
@@ -1129,6 +1134,45 @@ mod tests {
             // Second frame payload, from the RFC
             &[0xf2, 0x00, 0x11, 0x00, 0x00]
         );
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn compress_fragmented_message() {
+        use crate::extensions::compression::deflate::DeflateConfig;
+        use bytes::Bytes;
+        use crate::protocol::frame::{Frame, FrameSocket, coding::{Data as OpData, OpCode}};
+
+        let config = WebSocketConfig {
+            extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
+            ..Default::default()
+        };
+        let mut extensions = config.extensions.clone().into_unnegotiated_context(Role::Client);
+        let mut stream = Cursor::new(Vec::new());
+        let mut writer = WebSocket::from_raw_socket(&mut stream, Role::Server, Some(config));
+        let part = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let fragments = [
+            (OpData::Text, false, part.clone()),
+            (OpData::Continue, false, part.clone()),
+            (OpData::Continue, true, Bytes::new()),
+            (OpData::Binary, true, part),
+        ];
+        for (opcode, fin, payload) in &fragments {
+            writer.write(Message::Frame(Frame::message_fragment(payload.clone(), *opcode, *fin))).unwrap();
+        }
+        writer.flush().unwrap();
+
+        stream.set_position(0);
+        let mut frames = FrameSocket::new(stream);
+        for (opcode, fin, payload) in fragments {
+            let frame = frames.read(None).unwrap().unwrap();
+            assert_eq!(frame.header().opcode, OpCode::Data(opcode));
+            assert_eq!(frame.header().is_final, fin);
+            assert_eq!(frame.header().rsv1, opcode != OpData::Continue);
+            assert!(frame.payload().len() < 8192);
+            let decoded = extensions.per_message_decompressor().unwrap()(&frame.into_payload(), fin, payload.len()).unwrap();
+            assert_eq!(decoded, payload);
+        }
     }
 
     #[cfg(feature = "deflate")]

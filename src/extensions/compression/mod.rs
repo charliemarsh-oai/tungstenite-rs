@@ -41,15 +41,15 @@ impl PerMessageCompressionContext {
     #[inline]
     pub(crate) fn compressor<'s>(
         &'s mut self,
-    ) -> impl FnMut(&Bytes) -> Result<Bytes, CompressionError> + 's {
-        move |payload: &Bytes| match self {
+    ) -> impl FnMut(&Bytes, bool) -> Result<Bytes, CompressionError> + 's {
+        move |payload: &Bytes, is_final| match self {
             #[cfg(feature = "deflate")]
             Self::Deflate(deflate_config) => {
-                deflate_config.compress(payload).map_err(CompressionError::Deflate)
+                deflate_config.compress(payload, is_final).map_err(CompressionError::Deflate)
             }
             #[cfg(not(feature = "deflate"))]
             _ => {
-                let _ = payload;
+                let _ = (payload, is_final);
                 unreachable!("*PerMessageCompressionContext is uninhabited")
             }
         }

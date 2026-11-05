@@ -247,7 +247,8 @@ impl ExtensionsConfig {
 }
 
 impl Extensions {
-    /// Returns a function that, if present, compresses a message payload.
+    /// Returns a function that, if present, compresses a message fragment.
+    /// The boolean indicates the final fragment of a message.
     ///
     /// The returned value will only be `Some` if a per-message compression
     /// extension, as specified by [RFC 7692], was configured for the connection
@@ -257,7 +258,7 @@ impl Extensions {
     #[inline]
     pub(crate) fn per_message_compressor<'s>(
         &'s mut self,
-    ) -> Option<impl FnOnce(&Bytes) -> Result<Bytes, CompressionError> + 's> {
+    ) -> Option<impl FnOnce(&Bytes, bool) -> Result<Bytes, CompressionError> + 's> {
         let Self { per_message_compression } = self;
 
         per_message_compression.as_mut().map(PerMessageCompressionContext::compressor)
