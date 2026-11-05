@@ -1139,9 +1139,14 @@ mod tests {
     #[cfg(feature = "deflate")]
     #[test]
     fn compress_fragmented_message() {
-        use crate::extensions::compression::deflate::DeflateConfig;
+        use crate::{
+            extensions::compression::deflate::DeflateConfig,
+            protocol::frame::{
+                coding::{Data as OpData, OpCode},
+                Frame, FrameSocket,
+            },
+        };
         use bytes::Bytes;
-        use crate::protocol::frame::{Frame, FrameSocket, coding::{Data as OpData, OpCode}};
 
         let config = WebSocketConfig {
             extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
@@ -1158,7 +1163,9 @@ mod tests {
             (OpData::Binary, true, part),
         ];
         for (opcode, fin, payload) in &fragments {
-            writer.write(Message::Frame(Frame::message_fragment(payload.clone(), *opcode, *fin))).unwrap();
+            writer
+                .write(Message::Frame(Frame::message_fragment(payload.clone(), *opcode, *fin)))
+                .unwrap();
         }
         writer.flush().unwrap();
 
@@ -1170,7 +1177,12 @@ mod tests {
             assert_eq!(frame.header().is_final, fin);
             assert_eq!(frame.header().rsv1, opcode != OpData::Continue);
             assert!(frame.payload().len() < 8192);
-            let decoded = extensions.per_message_decompressor().unwrap()(&frame.into_payload(), fin, payload.len()).unwrap();
+            let decoded = extensions.per_message_decompressor().unwrap()(
+                &frame.into_payload(),
+                fin,
+                payload.len(),
+            )
+            .unwrap();
             assert_eq!(decoded, payload);
         }
     }
