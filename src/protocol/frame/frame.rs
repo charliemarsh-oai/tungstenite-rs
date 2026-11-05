@@ -203,6 +203,15 @@ impl FrameHeader {
     }
 }
 
+/// Whether this frame ends the current WebSocket message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fragment {
+    /// At least one more frame follows in this message.
+    More,
+    /// This is the last frame of the message.
+    Final,
+}
+
 /// A struct representing a WebSocket frame.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Frame {
@@ -307,8 +316,8 @@ impl Frame {
     /// Send the first fragment with `Data::Text` or `Data::Binary`, then send
     /// `Data::Continue` fragments until the final one. When permessage-deflate
     /// is negotiated, all fragments share one compression context for the message.
-    pub fn message_fragment(data: impl Into<Bytes>, opcode: Data, is_final: bool) -> Frame {
-        let mut frame = Self::message(data, OpCode::Data(opcode), is_final);
+    pub fn message_fragment(data: impl Into<Bytes>, opcode: Data, fragment: Fragment) -> Frame {
+        let mut frame = Self::message(data, OpCode::Data(opcode), fragment == Fragment::Final);
         frame.encode_extensions = true;
         frame
     }

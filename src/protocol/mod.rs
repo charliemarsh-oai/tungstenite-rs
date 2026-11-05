@@ -9,7 +9,7 @@ pub use self::{frame::CloseFrame, message::Message};
 use self::{
     frame::{
         coding::{CloseCode, Control as OpCtl, Data as OpData, OpCode},
-        Frame, FrameCodec,
+        Fragment, Frame, FrameCodec,
     },
     message::{IncompleteMessage, MessageType},
 };
@@ -571,17 +571,18 @@ impl WebSocketContext {
             return Err(Error::Protocol(ProtocolError::SendAfterClosing));
         }
 
-        let mut prepare_data_frame = |data, opdata, is_final| -> Result<Frame, ProtocolError> {
+        let mut prepare_data_frame = |data, opdata, fragment| -> Result<Frame, ProtocolError> {
+            let is_final = fragment == Fragment::Final;
             if let Some(compressor) = self.extensions.per_message_compressor() {
-                let compressed = compressor(&data, is_final)?;
+                let compressed = compressor(&data, fragment)?;
                 return Ok(Frame::compressed_message(compressed, opdata, is_final));
             }
             Ok(Frame::message(data, OpCode::Data(opdata), is_final))
         };
 
         let frame = match message {
-            Message::Text(data) => prepare_data_frame(data.into(), OpData::Text, true)?,
-            Message::Binary(data) => prepare_data_frame(data, OpData::Binary, true)?,
+            Message::Text(data) => prepare_data_frame(data.into(), OpData::Text, Fragment::Final)?,
+            Message::Binary(data) => prepare_data_frame(data, OpData::Binary, Fragment::Final)?,
             Message::Ping(data) => Frame::ping(data),
             Message::Pong(data) => {
                 self.set_additional(Frame::pong(data));
@@ -591,8 +592,9 @@ impl WebSocketContext {
             Message::Close(code) => return self.close(stream, code),
             Message::Frame(frame) => match frame.header().opcode {
                 OpCode::Data(opcode) if frame.encode_extensions => {
-                    let is_final = frame.header().is_final;
-                    prepare_data_frame(frame.into_payload(), opcode, is_final)?
+                    let fragment =
+                        if frame.header().is_final { Fragment::Final } else { Fragment::More };
+                    prepare_data_frame(frame.into_payload(), opcode, fragment)?
                 }
                 _ => frame,
             },
@@ -1143,7 +1145,7 @@ mod tests {
             extensions::compression::deflate::DeflateConfig,
             protocol::frame::{
                 coding::{Data as OpData, OpCode},
-                Frame, FrameSocket,
+                Fragment, Frame, FrameSocket,
             },
         };
         use bytes::Bytes;
@@ -1157,29 +1159,30 @@ mod tests {
         let mut writer = WebSocket::from_raw_socket(&mut stream, Role::Server, Some(config));
         let part = Bytes::from(vec![b'x'; 1024 * 1024]);
         let fragments = [
-            (OpData::Text, false, part.clone()),
-            (OpData::Continue, false, part.clone()),
-            (OpData::Continue, true, Bytes::new()),
-            (OpData::Binary, true, part),
+            (OpData::Text, Fragment::More, part.clone()),
+            (OpData::Continue, Fragment::More, part.clone()),
+            (OpData::Continue, Fragment::Final, Bytes::new()),
+            (OpData::Binary, Fragment::Final, part),
         ];
-        for (opcode, fin, payload) in &fragments {
+        for (opcode, fragment, payload) in &fragments {
             writer
-                .write(Message::Frame(Frame::message_fragment(payload.clone(), *opcode, *fin)))
+                .write(Message::Frame(Frame::message_fragment(payload.clone(), *opcode, *fragment)))
                 .unwrap();
         }
         writer.flush().unwrap();
 
         stream.set_position(0);
         let mut frames = FrameSocket::new(stream);
-        for (opcode, fin, payload) in fragments {
+        for (opcode, fragment, payload) in fragments {
+            let is_final = fragment == Fragment::Final;
             let frame = frames.read(None).unwrap().unwrap();
             assert_eq!(frame.header().opcode, OpCode::Data(opcode));
-            assert_eq!(frame.header().is_final, fin);
+            assert_eq!(frame.header().is_final, is_final);
             assert_eq!(frame.header().rsv1, opcode != OpData::Continue);
             assert!(frame.payload().len() < 8192);
             let decoded = extensions.per_message_decompressor().unwrap()(
                 &frame.into_payload(),
-                fin,
+                is_final,
                 payload.len(),
             )
             .unwrap();
